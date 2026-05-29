@@ -1,0 +1,1175 @@
+\documentclass[10pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[spanish]{babel}
+\usepackage{geometry}
+\geometry{margin=2.5cm}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{float}
+
+\definecolor{codebg}{rgb}{0.95,0.95,0.95}
+\lstdefinestyle{cpp}{
+    language=C++,
+    basicstyle=\ttfamily\small,
+    backgroundcolor=\color{codebg},
+    frame=single,
+    breaklines=true,
+    numbers=left,
+    numberstyle=\tiny,
+    keywordstyle=\color{blue},
+    commentstyle=\color{green!50!black},
+    stringstyle=\color{red},
+    tabsize=4
+}
+\lstdefinestyle{python}{
+    language=Python,
+    basicstyle=\ttfamily\small,
+    backgroundcolor=\color{codebg},
+    frame=single,
+    breaklines=true,
+    numbers=left,
+    numberstyle=\tiny,
+    keywordstyle=\color{blue},
+    commentstyle=\color{green!50!black},
+    stringstyle=\color{red},
+    tabsize=4
+}
+
+\lstset{style=python}
+
+\title{\textbf{Informe Grupal: Prueba(Parte II) - Desarrollo grupal de estrategias}}
+\author{Grupo -- INF8090 Computaci\'on Paralela y Distribuida}
+\date{Mayo 2026}
+
+
+\begin{document}
+\maketitle
+
+\section*{Datos del Grupo}
+\begin{table}[H]
+\centering
+\begin{tabular}{p{6cm}p{7cm}}
+\toprule
+\textbf{Integrante} & \textbf{Correo / Identificaci\'on} \\
+\midrule
+Elliot Acevedo Zuñiga & eacevedoz@utem.cl\\
+Benjamin Aballay Palma 2 & baballay@utem.cl\\ 
+Felipe Martinez Gonzalez 3 & fmartinezgo@utem.cl\\
+\bottomrule
+\end{tabular}
+\end{table}
+\vspace{0.5cm}
+\noindent\textbf{Curso:} INF8090 -- Computaci\'on Paralela y Distribuida\\
+\textbf{Evaluaci\'on:} Prueba 1 -- Parte II Grupal\\
+\textbf{Fecha:} Mayo 2026
+\newpage
+
+% ============================================================
+\section{Ejercicio 1: Normalizaci\'on Z-Score con OpenMP en C++}
+% ============================================================
+
+\subsection{Diagn\'ostico y Selecci\'on de Estrategia}
+
+Durante la evaluaci\'on individual (Parte I), no se dej\'o registro de una
+estrategia preliminar escrita para este ejercicio. Por lo tanto, al iniciar la
+Parte II, el grupo parti\'o desde cero para evaluar c\'omo abordar el c\'alculo
+de la media, varianza y normalizaci\'on Z-Score sobre 6.4 GB de datos.
+
+Al discutir las alternativas como grupo, nos planteamos inicialmente un enfoque
+ingenuo: paralelizar el c\'alculo directamente usando \texttt{\#pragma omp critical}
+o \texttt{atomic} para ir sumando la media y varianza global a medida que se
+le\'ia cada fila.
+
+Sin embargo, descartamos esa opci\'on y llegamos a la conclusi\'on de que la
+mejor forma de hacerlo era mediante reducciones y variables locales (Estrategia
+de Memoria Compartida Local) por las siguientes razones t\'ecnicas:
+
+\begin{itemize}
+    \item \textbf{Control de Dependencias y Sincronizaci\'on:} Hacer un bloqueo
+        constante (\texttt{critical}) por cada celda v\'alida obligar\'ia a los
+        hilos a esperar turno millones de veces, serializando el c\'odigo y
+        destruyendo el rendimiento. En su lugar, decidimos usar la directiva
+        \texttt{reduction(+:...)} de OpenMP para las sumas globales (media y
+        varianza). OpenMP maneja los acumuladores privados por hilo en bajo
+        nivel y los suma al final de forma ultra eficiente.
+    \item \textbf{Manejo de Localidad y Memoria:} Como este es un problema
+        fuertemente limitado por el ancho de banda de la memoria
+        (\emph{memory-bound}), estructuramos el c\'odigo repartiendo las filas
+        con un \emph{scheduling} est\'atico (\texttt{\#pragma omp parallel for}).
+        Esto permite que los n\'ucleos de la CPU trabajen sin el problema de
+        \emph{false sharing}, aprovechando la cach\'e local antes de sincronizar
+        resultados.
+\end{itemize}
+
+\subsection{Diagn\'ostico del Problema}
+
+Se requiere normalizar una matriz de punto flotante de dimensi\'on
+$50\,000\,000 \times 16$ ($\sim$6.4 GB en precisi\'on doble) que contiene
+valores faltantes (NaN) en aproximadamente el 5\% de sus celdas. La
+normalizaci\'on Z-Score se define como:
+
+\[
+z_{ij} = \frac{x_{ij} - \mu_j}{\sigma_j}
+\qquad
+\mu_j = \frac{1}{N_j}\sum_{i \notin \text{NaN}} x_{ij}
+\qquad
+\sigma_j = \sqrt{\frac{1}{N_j}\sum_{i \notin \text{NaN}} (x_{ij} - \mu_j)^2}
+\]
+
+donde $\mu_j$ y $\sigma_j$ se calculan ignorando los NaN, y los NaN se
+preservan en la salida. Adem\'as, se cuentan los valores at\'ipicos
+(\emph{outliers}) definidos como $|z_{ij}| > 3$.
+
+El problema presenta tres desaf\'ios fundamentales:
+\begin{enumerate}
+    \item \textbf{Volumen de datos}: 6.4 GB excede la cach\'e de cualquier CPU
+        moderna, por lo que el cuello de botella es el ancho de banda de la
+        memoria principal (DRAM), no la capacidad de c\'omputo.
+    \item \textbf{Manejo de NaN}: Cada celda debe verificarse con
+        \texttt{isnan()} antes de contribuir a los estad\'isticos o a la
+        normalizaci\'on.
+    \item \textbf{Tres fases de recorrido}: A diferencia de la normalizaci\'on
+        min-max (que requiere una pasada de min/max y otra de normalizaci\'on),
+        el Z-Score exige tres pasadas completas: media, varianza y
+        normalizaci\'on, incrementando el tr\'afico de memoria en $\sim$33\%.
+\end{enumerate}
+
+\subsection{Datos}
+
+Se gener\'o un dataset sint\'etico de $50\,000\,000 \times 16$ a partir de
+coordenadas reales de viajes de Uber (archivos CSV p\'ublicos con $>2$ millones
+de registros). Cada fila representa un viaje con 16 atributos num\'ericos:
+coordenadas de recogida y destino, distancia, tarifa, propina, peajes,
+velocidad, tiempo en tr\'afico, duraci\'on, multiplicador \emph{surge},
+cantidad de pasajeros y calificaci\'on del conductor. Se inyect\'o 5\% de NaN
+aleatorio. El archivo se guard\'o en formato binario plano (\texttt{double[]})
+para lectura directa desde C++.
+
+\subsection{Estrategia de Soluci\'on}
+
+Se dise\~n\'o un pipeline de tres fases, cada una implementada con private
+arrays por hilo para evitar \emph{false sharing} y una secci\'on
+\texttt{critical} para combinar al final:
+
+\begin{enumerate}
+    \item \textbf{Fase 1 (Media y conteo v\'alido)}: Recorrido de lectura con
+        arreglos privados \texttt{local\_sums[NCOLS]} y
+        \texttt{local\_vals[NCOLS]}. Cada hilo acumula sumas y conteos en sus
+        arreglos locales. Al finalizar, se combinan en una secci\'on
+        \texttt{critical}. Luego $\mu_j = \text{sum}_j / \text{count}_j$.
+    \item \textbf{Fase 2 (Varianza)}: Segundo recorrido de lectura similar,
+        acumulando $\sum (x_{ij} - \mu_j)^2$ en arreglos privados
+        \texttt{local\_sum\_sq[NCOLS]} y combinando con \texttt{critical}.
+        Luego $\sigma_j = \sqrt{\text{sum\_sq}_j / \text{count}_j}$.
+    \item \textbf{Fase 3 (Normalizaci\'on Z-Score y detecci\'on de at\'ipicos)}:
+        Tercer recorrido con \texttt{\#pragma omp parallel for
+        reduction(+:outliers)}. Cada celda v\'alida se transforma a
+        $z = (x - \mu_j) / \sigma_j$; se cuenta como at\'ipico si
+        $|z| > 3$. Los NaN se preservan.
+\end{enumerate}
+
+\subsubsection{Justificaci\'on T\'ecnica de OpenMP}
+
+Se seleccion\'o OpenMP sobre MPI o hilos POSIX por las siguientes razones:
+
+\begin{itemize}
+    \item \textbf{Memoria compartida}: Toda la matriz cabe en la RAM del sistema
+        (15 GB disponibles), por lo que no se requiere distribuci\'on entre nodos.
+    \item \textbf{Directivas de alto nivel}: \texttt{parallel for} y
+        \texttt{critical} permiten paralelizar con m\'inima intervenci\'on
+        manual sobre sincronizaci\'on.
+    \item \textbf{Granularidad gruesa}: El trabajo por fila es homog\'eneo
+        (cada fila procesa 16 doubles), por lo que \texttt{schedule(static)}
+        por defecto balancea bien la carga.
+    \item \textbf{Escalabilidad esperada}: Al ser un problema
+        \emph{memory-bound}, se anticipa que el speedup est\'e limitado por el
+        ancho de banda de memoria, no por el n\'umero de n\'ucleos.
+\end{itemize}
+
+\subsubsection{Uso de reduction y arreglos privados}
+
+Para evitar \emph{false sharing} y condiciones de carrera, las Fases 1 y 2
+utilizan arreglos privados por hilo (\texttt{local\_sums}, \texttt{local\_vals},
+\texttt{local\_sum\_sq}) en una regi\'on \texttt{parallel}, combinando al final
+con una secci\'on \texttt{critical} (solo 16 sumas por hilo, overhead
+despreciable). La Fase 3 usa \texttt{reduction(+:outliers)} que crea copias
+privadas del contador y las combina al finalizar el bucle.
+
+\subsection{Benchmark y Resultados}
+
+\subsubsection{Registro del Entorno de Ejecuci\'on}
+
+\begin{itemize}
+    \item \textbf{Sistema operativo}: Linux 7.0.10-1-cachyos (Arch Linux)
+    \item \textbf{CPU}: AMD Ryzen 7 5700G, 8 n\'ucleos f\'isicos, 16 hilos l\'ogicos
+    \item \textbf{RAM}: 15 GB total, $\sim$11 GB disponibles
+    \item \textbf{Compilador}: GCC 16.1.1 20260430
+    \item \textbf{Soporte OpenMP}: OpenMP 5.1 (GCC libgomp)
+    \item \textbf{Banderas de compilaci\'on}: \texttt{g++ -O3 -fopenmp -march=native}
+    \item \textbf{Tama\~no de datos}: $50\,000\,000 \times 16 = 6.4$ GB
+    \item \textbf{Repeticiones}: Una corrida por configuraci\'on
+    \item \textbf{M\'etrica principal}: Tiempo total = Fase 1 + Fase 2 + Fase 3
+\end{itemize}
+
+\subsubsection{Tabla de Tiempos}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{crrrrr}
+\toprule
+\textbf{Hilos} & \textbf{Fase 1 (s)} & \textbf{Fase 2 (s)} & \textbf{Fase 3 (s)} & \textbf{Total (s)} & \textbf{Speedup $S_p$} \\
+\midrule
+1 & 0.8340 & 0.7800 & 1.0272 & 2.6412 & 1.000 \\
+2 & 0.3126 & 0.4102 & 0.7544 & 1.4773 & 1.788 \\
+4 & 0.2059 & 0.2282 & 0.8009 & 1.2350 & 2.139 \\
+8 & 0.2469 & 0.2350 & 0.8331 & 1.3150 & 2.008 \\
+\bottomrule
+\end{tabular}
+\caption{Tiempos de ejecuci\'on medidos y speedup respecto a 1 hilo.}
+\end{table}
+
+\subsubsection{C\'alculo de Speedup y Eficiencia}
+
+\[
+S_p = \frac{T_1}{T_p} \qquad E_p = \frac{S_p}{p}
+\]
+
+\begin{table}[H]
+\centering
+\begin{tabular}{crrr}
+\toprule
+$p$ & $T_p$ (s) & $S_p$ & $E_p$ (\%) \\
+\midrule
+1 & 2.6412 & 1.000 & 100.0 \\
+2 & 1.4773 & 1.788 & 89.4 \\
+4 & 1.2350 & 2.139 & 53.5 \\
+8 & 1.3150 & 2.008 & 25.1 \\
+\bottomrule
+\end{tabular}
+\caption{Speedup y eficiencia para cada configuraci\'on de hilos.}
+\end{table}
+
+\subsubsection{An\'alisis de Resultados}
+
+El speedup m\'aximo alcanzado es de $2.14\times$ con 4 hilos. Con 8 hilos el
+rendimiento decrece ligeramente ($2.01\times$). Este comportamiento es
+consistente con un problema limitado por ancho de banda de memoria:
+
+\begin{itemize}
+    \item Las fases 1 y 2 son de solo lectura y escalan mejor: $S_4 \approx
+        3.6\times$ y $S_8 \approx 3.3\times$ en la fase 1, pues los 6.4 GB
+        se leen desde DRAM sin contenci\'on de escritura.
+    \item La fase 3 (normalizaci\'on) lee y escribe 6.4 GB, saturando el bus
+        de memoria. Con 1 hilo la velocidad efectiva es
+        $6.4 / 1.0272 \approx 6.2$ GB/s; con 2 hilos sube a $\sim$8.5 GB/s,
+        y con 4 u 8 hilos se estabiliza en $\sim$8 GB/s, indicando saturaci\'on
+        del ancho de banda DDR4.
+    \item El speedup total es menor que el del min-max original debido a las
+        tres pasadas completas sobre los datos.
+    \item Se detectaron 4\,734\,853 valores at\'ipicos ($|Z| > 3$), que
+        representan el 0.62\% de los datos v\'alidos.
+\end{itemize}
+
+\subsubsection{Por qu\'e \texttt{critical} dentro del bucle principal ser\'ia una mala decisi\'on}
+
+Si se usara \texttt{\#pragma omp critical} dentro del bucle de normalizaci\'on
+para proteger la escritura de cada celda, se introducir\'ia una serializaci\'on
+completa: todos los hilos competir\'ian por la misma secci\'on cr\'itica,
+anulando cualquier beneficio del paralelismo. El overhead de entrar y salir
+de la secci\'on cr\'itica $800$ millones de veces har\'ia la ejecuci\'on mucho
+m\'as lenta que la versi\'on secuencial.
+
+En nuestra implementaci\'on, la secci\'on \texttt{critical} se usa solo una vez
+por hilo por fase para combinar 16 o 32 valores, lo que representa un overhead
+despreciable.
+
+\subsubsection{Error Num\'erico y Orden de Reducci\'on en Punto Flotante}
+
+La suma de punto flotante no es asociativa debido a la precisi\'on finita de
+IEEE 754. En las fases 1 y 2, los acumuladores privados se suman en orden
+indeterminado dentro de la secci\'on \texttt{critical}, lo que puede producir
+diferencias del orden de $10^{-6}$ en $\mu_j$ y $\sigma_j$ entre ejecuciones.
+Este error es despreciable para el an\'alisis de datos y no afecta la
+clasificaci\'on de at\'ipicos.
+
+\subsection{Conclusiones del Ejercicio 1}
+
+\begin{enumerate}
+    \item El problema es \emph{memory-bound}. El speedup est\'a limitado por
+        el ancho de banda de memoria DDR4, no por la capacidad de c\'omputo.
+    \item El Z-Score requiere 3 pasadas completas sobre los datos, incrementando
+        el tr\'afico de memoria en $\sim$33\% respecto a min-max.
+    \item OpenMP permite paralelizar eficientemente usando arreglos privados
+        por hilo y secciones \texttt{critical} para combinar.
+    \item La estrategia fallar\'ia en sistemas con menos RAM que el tama\~no
+        del dataset, requiriendo procesamiento por bloques con lectura a disco.
+\end{enumerate}
+
+% ============================================================
+\section{Ejercicio 2: Pipeline Concurrente de Procesamiento de Logs en Python}
+% ============================================================
+
+\subsection{Diagn\'ostico y Selecci\'on de Estrategia}
+
+Durante la evaluaci\'on individual (Parte I), cada integrante propuso una
+estrategia distinta para este problema. Al comparar en grupo, las diferencias
+m\'as relevantes giraron en torno a si usar \texttt{threading},
+\texttt{multiprocessing} o un enfoque h\'ibrido. La discusi\'on nos llev\'o a
+descartar \texttt{threading} como soluci\'on principal y a elegir
+\textbf{\texttt{ProcessPoolExecutor} con particionamiento por chunks} por las
+siguientes razones:
+
+\begin{itemize}
+    \item \textbf{El GIL bloquea las etapas m\'as costosas}: las etapas de
+        parseo, limpieza y agregaci\'on son CPU-bound y ejecutan Python puro.
+        El GIL impide que dos hilos ejecuten bytecode Python simult\'aneamente,
+        por lo que \texttt{threading} no introduce paralelismo real en estas
+        fases.
+    \item \textbf{La lectura puede ser secuencial}: la descompresi\'on con
+        \texttt{gzip} libera el GIL parcialmente (la rutina de inflado est\'a
+        en C), por lo que \texttt{threading} ayudar\'ia en la lectura, pero
+        ese beneficio es menor comparado con el costo del parseo.
+    \item \textbf{El merge es seguro sin locks}: al usar el patr\'on
+        \emph{map-reduce} (cada worker retorna un diccionario parcial y el
+        proceso principal los combina), se evitan condiciones de carrera sin
+        ning\'un mecanismo de sincronizaci\'on expl\'icito. Esto es equivalente
+        a \texttt{reduction} en OpenMP.
+\end{itemize}
+
+Descartamos \texttt{asyncio} porque los logs est\'an en disco local, no en red.
+
+\subsection{Diagn\'ostico del Problema}
+
+Se requiere procesar 2 GB de logs comprimidos en formato JSONL con los campos:
+\texttt{user\_id}, \texttt{timestamp}, \texttt{endpoint}, \texttt{latency\_ms}
+y \texttt{status\_code}. El objetivo es agregar m\'etricas por ventanas
+temporales de 10 minutos.
+
+\begin{table}[H]
+\centering
+\begin{tabular}{lll}
+\toprule
+\textbf{Etapa} & \textbf{Tipo de carga} & \textbf{Raz\'on} \\
+\midrule
+Lectura y descompresi\'on & I/O-bound & Acceso a disco; \texttt{gzip} usa C interno \\
+Parseo JSON              & CPU-bound & \texttt{json.loads()} por l\'inea, Python puro \\
+Limpieza y validaci\'on  & CPU-bound & Verificaciones de campos, conversiones de tipo \\
+Agregaci\'on por ventanas & CPU-bound & Agrupaciones, sumas, conteos en diccionarios \\
+Escritura de resultados  & I/O-bound & Salida peque\~na, no es cuello de botella \\
+\bottomrule
+\end{tabular}
+\caption{Tipo de carga por etapa del pipeline.}
+\end{table}
+
+\subsection{Dataset Sint\'etico}
+
+Se gener\'o un dataset sint\'etico de aproximadamente 2 GB comprimidos
+($\sim$50 millones de l\'ineas) usando NumPy:
+
+\begin{lstlisting}[style=python, caption={Generaci\'on de dataset sint\'etico.}]
+import gzip, json, numpy as np
+from datetime import datetime, timedelta
+
+def generate_logs(n=50_000_000, filename="logs.jsonl.gz"):
+    users     = [f"user_{i}" for i in range(1000)]
+    endpoints = ["/api/search", "/api/checkout", "/api/login", "/api/data"]
+    codes     = [200, 200, 200, 404, 500]
+    base      = datetime(2024, 1, 1)
+    batch     = 100_000
+    with gzip.open(filename, "wt") as f:
+        for start in range(0, n, batch):
+            size = min(batch, n - start)
+            u   = np.random.randint(0, 1000, size)
+            e   = np.random.randint(0, 4, size)
+            c   = np.random.choice(codes, size)
+            lat = np.round(np.random.normal(120, 40, size), 2)
+            ts_offsets = np.arange(start, start + size) * 0.1
+            for i in range(size):
+                ts = (base + timedelta(
+                    seconds=float(ts_offsets[i]))).isoformat()
+                f.write(json.dumps({
+                    "user_id":     users[u[i]],
+                    "timestamp":   ts,
+                    "endpoint":    endpoints[e[i]],
+                    "latency_ms":  float(lat[i]),
+                    "status_code": int(c[i])
+                }) + "\n")
+\end{lstlisting}
+
+\textbf{Nota sobre escala}: el benchmark se ejecut\'o sobre 5 millones de
+l\'ineas ($\sim$200 MB comprimidos) y los resultados se extrapolan linealmente
+a 50 millones, lo cual es v\'alido porque el trabajo por l\'inea es homog\'eneo.
+
+\subsection{Tabla Comparativa de Estrategias}
+
+\begin{table}[H]
+\centering
+\small
+\begin{tabular}{p{2.8cm}p{2.2cm}p{2.2cm}p{2.2cm}p{2.2cm}}
+\toprule
+\textbf{Criterio} & \textbf{Secuencial} & \textbf{threading /} \newline \textbf{ThreadPool} & \textbf{multiprocessing /} \newline \textbf{ProcessPool} & \textbf{H\'ibrido} \newline \textbf{(asyncio+MP)} \\
+\midrule
+Paralelismo CPU real        & No & No (GIL) & S\'i & S\'i \\
+Paralelismo I/O             & No & S\'i      & S\'i & S\'i \\
+Overhead                    & M\'inimo & Bajo & Alto (fork+pickle) & Medio \\
+Complejidad c\'odigo        & Baja & Baja & Media & Alta \\
+\'Util parseo CPU-bound     & No & No & S\'i & S\'i \\
+\'Util lectura I/O-bound    & No & S\'i & S\'i & S\'i \\
+\textbf{Recomendado}        & Baseline & No & \textbf{S\'i} & Solo logs en red \\
+\bottomrule
+\end{tabular}
+\caption{Comparaci\'on de estrategias de concurrencia.}
+\end{table}
+
+\subsection{Impacto del GIL}
+
+\begin{itemize}
+    \item \textbf{Lectura y descompresi\'on}: \texttt{zlib} libera el GIL
+        durante el inflado. \texttt{threading} s\'i paralela esta etapa
+        parcialmente.
+    \item \textbf{Parseo JSON}: \texttt{json.loads()} est\'a en C pero crear
+        objetos Python requiere el GIL. Beneficio marginal con
+        \texttt{threading}.
+    \item \textbf{Limpieza y agregaci\'on}: Python puro. El GIL bloquea
+        completamente. Solo \texttt{multiprocessing} es efectivo.
+\end{itemize}
+
+\subsection{Estrategia Seleccionada}
+
+\subsubsection{Dise\~no de Particionamiento}
+
+Se particiona el archivo en chunks de 50.000 l\'ineas. Cada chunk es una lista
+de strings enviada a un worker. El worker retorna un diccionario parcial con
+clave $(\texttt{endpoint},\; \texttt{ventana\_10min})$ y valor
+$\{\texttt{count},\; \texttt{total\_latency},\; \texttt{errors}\}$.
+El proceso principal combina los diccionarios con una reducci\'on secuencial
+sin locks.
+
+\subsubsection{Pseudoc\'odigo}
+
+\begin{lstlisting}[style=python, caption={Pipeline con ProcessPoolExecutor.}]
+from concurrent.futures import ProcessPoolExecutor
+from collections import defaultdict
+import gzip, json
+
+def read_chunks(filepath, chunk_size=50_000):
+    with gzip.open(filepath, "rt") as f:
+        chunk = []
+        for line in f:
+            chunk.append(line)
+            if len(chunk) >= chunk_size:
+                yield chunk
+                chunk = []
+        if chunk:
+            yield chunk
+
+def process_chunk(lines):
+    partial = defaultdict(lambda: {"count": 0,
+                                   "total_latency": 0.0,
+                                   "errors": 0})
+    for line in lines:
+        try:
+            r = json.loads(line)
+            if r["latency_ms"] < 0:
+                continue
+            key = (r["endpoint"], r["timestamp"][:15] + "0:00")
+            partial[key]["count"]         += 1
+            partial[key]["total_latency"] += r["latency_ms"]
+            if r["status_code"] >= 400:
+                partial[key]["errors"]    += 1
+        except (json.JSONDecodeError, KeyError):
+            continue
+    return dict(partial)
+
+def merge_results(partials):
+    final = defaultdict(lambda: {"count": 0,
+                                 "total_latency": 0.0,
+                                 "errors": 0})
+    for partial in partials:
+        for key, vals in partial.items():
+            final[key]["count"]         += vals["count"]
+            final[key]["total_latency"] += vals["total_latency"]
+            final[key]["errors"]        += vals["errors"]
+    return final
+
+def run_pipeline(filepath, n_workers=4):
+    import time
+    t0       = time.perf_counter()
+    chunks   = list(read_chunks(filepath))
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        partials = list(pool.map(process_chunk, chunks))
+    final    = merge_results(partials)
+    return final, time.perf_counter() - t0
+\end{lstlisting}
+
+El merge no requiere locks porque todos los workers terminan antes de que
+\texttt{merge\_results} comience (barrera impl\'icita al salir del bloque
+\texttt{with}). Es el equivalente directo de \texttt{reduction(+:...)} en
+OpenMP.
+
+\subsection{Identificaci\'on de Overhead}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{p{3cm}p{4cm}p{3.5cm}p{3cm}}
+\toprule
+\textbf{Fuente} & \textbf{D\'onde ocurre} & \textbf{Magnitud} & \textbf{Mitigaci\'on} \\
+\midrule
+Serializaci\'on pickle & Env\'io de chunks y recepci\'on de dicts & Alta si chunks $<$ 10K l\'ineas & Chunks de 50K ($\approx$5 MB) \\
+Fork de procesos & Creaci\'on del pool & Fijo $\sim$100--300 ms & Reutilizar el pool \\
+Copia IPC & Worker $\to$ proceso principal & Proporcional al dict parcial & Devolver solo agregaciones \\
+Merge secuencial & Proceso principal & $<$ 1\% del tiempo total & No paralelizar \\
+\bottomrule
+\end{tabular}
+\caption{Fuentes de overhead y mitigaciones.}
+\end{table}
+
+\subsection{Benchmark y Resultados}
+
+\subsubsection{Registro del Entorno de Ejecuci\'on}
+
+\begin{itemize}
+    \item \textbf{Sistema operativo}: Windows 11
+    \item \textbf{CPU}: AMD Ryzen 5 5500, 6 n\'ucleos f\'isicos, 12 hilos l\'ogicos
+    \item \textbf{RAM}: 32 GB 
+    \item \textbf{Versi\'on Python}: 3.12.3
+    \item \textbf{Tama\~no de datos medido}: 5.000.000 l\'ineas ($\approx$200 MB comprimidos)
+    \item \textbf{Tama\~no de datos objetivo}: 50.000.000 l\'ineas ($\approx$2 GB comprimidos)
+    \item \textbf{Repeticiones}: 5 por configuraci\'on; 2 warm-up descartadas
+    \item \textbf{Chunk size}: 50.000 l\'ineas
+    \item \textbf{M\'etrica}: tiempo wall-clock total (lectura + procesamiento + merge)
+\end{itemize}
+
+\subsubsection{Tabla de Tiempos Medidos (5M l\'ineas)}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{crrrr}
+\toprule
+\textbf{Estrategia} & \textbf{Workers} & \textbf{Tiempo (s)} & \textbf{Speedup $S_p$} & \textbf{Eficiencia $E_p$ (\%)} \\
+\midrule
+Secuencial               & 1 & 15.57 & 1.00 & 100.0 \\
+\texttt{threading}       & 4 & 15.18 & 1.03 & 25.7  \\
+\texttt{multiprocessing} & 2 & 8.31  & 1.87 & 93.7  \\
+\texttt{multiprocessing} & 4 & 4.81  & 3.24 & 80.9  \\
+\texttt{multiprocessing} & 8 & 3.44  & 4.53 & 56.7  \\
+\bottomrule
+\end{tabular}
+\caption{Tiempos medidos sobre 5M l\'ineas.}
+\end{table}
+\[
+S_p = \frac{T_1}{T_p} \qquad E_p = \frac{S_p}{p}
+\]
+
+Con 4 workers: $S_4 = 15.57/4.81 = 3.24$, $E_4 = 80.9\%$. \quad
+Con 8 workers: $S_8 = 15.57/3.44 = 4.53$, $E_8 = 56.7\%$.
+
+\subsubsection{An\'alisis de Resultados}
+
+\begin{itemize}
+    \item \textbf{\texttt{threading} no escala}: speedup de $1.03\times$
+        confirma que el GIL anula el paralelismo CPU-bound.
+    \item \textbf{\texttt{multiprocessing} escala bien}: eficiencia de 93.7\%
+        con 2 workers y 80.9\% con 4 workers, mostrando overhead moderado
+        de pickle.
+    \item \textbf{Saturaci\'on a 8 workers}: con 8 workers se supera el
+        n\'umero de n\'ucleos f\'isicos (6), por lo que los workers
+        adicionales operan sobre hilos l\'ogicos via hyperthreading,
+        explicando la menor eficiencia (56.7\%).
+    \item \textbf{Extrapolaci\'on lineal v\'alida}: el n\'umero de grupos de
+        agregaci\'on es finito ($\approx$35.000 grupos), no crece
+        superlinealmente.
+\end{itemize}
+
+\subsection{Riesgos y Limitaciones}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{p{3cm}p{5cm}p{5cm}}
+\toprule
+\textbf{Riesgo} & \textbf{Descripci\'on} & \textbf{Condici\'on de fallo} \\
+\midrule
+Cuello de botella en lectura & Lectura secuencial limita el throughput & Disco lento (HDD) o archivo en red \\
+OOM en merge & Dict final crece si hay muchas claves \'unicas & Ventanas $<$ 1 min o millones de endpoints \\
+Overhead domina & Pickle supera el beneficio con chunks peque\~nos & chunk\_size $<$ 10K con muchos workers \\
+\texttt{asyncio} ineficaz & No ayuda con I/O de disco local & Solo si logs vienen de S3 o HTTP \\
+\bottomrule
+\end{tabular}
+\caption{Riesgos identificados y condiciones de fallo.}
+\end{table}
+
+\subsection{Conclusiones del Ejercicio 2}
+
+\begin{enumerate}
+    \item No existe una herramienta universal: \texttt{multiprocessing} es la
+        \'unica opci\'on efectiva en Python para pipelines CPU-bound con logs
+        en disco local.
+    \item El GIL hace que \texttt{threading} sea ineficaz en las etapas
+        dominantes; el speedup real es $\approx 1.0$.
+    \item El patr\'on map-reduce elimina la necesidad de locks por dise\~no,
+        equivalente a \texttt{reduction} en OpenMP.
+    \item El speedup m\'aximo real es $\approx 4\times$ antes de saturar la
+        lectura. Dividir el dataset en m\'ultiples archivos permitir\'ia
+        paralelizar tambi\'en la lectura.
+\end{enumerate}
+
+% ============================================================
+\section{Ejercicio 3: C\'alculo de Similitud por Bloques para Embeddings}
+% ============================================================
+
+\subsection{Diagn\'ostico y Selecci\'on de Estrategia}
+
+El problema consiste en calcular similitudes entre $20\,000$ embeddings de
+dimensi\'on $128$, normalizados a norma unitaria, y obtener para cada vector
+sus $10$ vecinos m\'as similares. La similitud utilizada corresponde a
+similitud coseno. Como todos los vectores est\'an normalizados a norma $1$, la
+similitud coseno se reduce al producto punto:
+
+\[
+\operatorname{sim}(x_i,x_j)=
+\frac{x_i \cdot x_j}{\|x_i\|_2\|x_j\|_2}
+= x_i \cdot x_j
+\]
+
+La estrategia ingenua consiste en construir la matriz completa de similitud
+$S = XX^T$, donde $X \in \mathbb{R}^{20000 \times 128}$ y
+$S \in \mathbb{R}^{20000 \times 20000}$. Sin embargo, esta estrategia almacena
+$400\,000\,000$ valores aunque el objetivo final solo requiere $10$ valores por
+fila. Por lo tanto, se descarta la materializaci\'on completa de la matriz y se
+selecciona una estrategia exacta basada en procesamiento por bloques y
+actualizaci\'on incremental del top-$k$.
+
+La soluci\'on implementada utiliza Python con \texttt{NumPy} y
+\texttt{multiprocessing}. No se usa \texttt{g++} ni OpenMP en esta parte, porque
+el ejercicio exige una estrategia de bloques, memoria, top-$k$ y m\'etricas de
+rendimiento, pero no obliga a implementar OpenMP espec\'ificamente para este
+tercer ejercicio. Para evitar la limitaci\'on del GIL de Python, se utilizan
+procesos mediante \texttt{ProcessPoolExecutor}. La matriz de embeddings se
+comparte entre procesos con \texttt{shared\_memory}, evitando copiar el dataset
+completo a cada worker.
+
+\subsection{Diagn\'ostico del Problema}
+
+Sea $N=20\,000$ el n\'umero de vectores y $D=128$ la dimensi\'on de cada
+embedding. Si se comparan todos los vectores contra todos los vectores, el
+n\'umero de comparaciones es:
+
+\[
+N(N-1) = 20\,000 \times 19\,999 = 399\,980\,000
+\]
+
+Si se considera tambi\'en la diagonal, la matriz completa tiene:
+
+\[
+N^2 = 20\,000^2 = 400\,000\,000
+\]
+
+entradas. Cada comparaci\'on requiere aproximadamente $D$ multiplicaciones y
+sumas, por lo que el costo computacional es:
+
+\[
+O(N^2D)
+\]
+
+Para este caso:
+
+\[
+400\,000\,000 \times 128 = 51\,200\,000\,000
+\]
+
+operaciones elementales de multiplicaci\'on-acumulaci\'on aproximadas. Por lo
+tanto, el problema no se resuelve simplemente paralelizando un doble bucle. La
+dificultad real est\'a en controlar memoria, localidad de acceso, top-$k$
+parcial, reducci\'on de candidatos y costo cuadr\'atico.
+
+\subsection{Dataset Utilizado}
+
+Se gener\'o un dataset sint\'etico compuesto por $20\,000$ vectores de
+dimensi\'on $128$. Los valores se generaron con distribuci\'on normal est\'andar
+y posteriormente cada fila fue normalizada por su norma euclidiana:
+
+\[
+x_i \leftarrow \frac{x_i}{\|x_i\|_2}
+\]
+
+Esto garantiza que:
+
+\[
+\|x_i\|_2 = 1
+\]
+
+La generaci\'on sint\'etica es adecuada para este ejercicio porque permite
+controlar exactamente el tama\~no del problema, cumplir con el formato exigido
+y reproducir los resultados usando una semilla fija.
+
+\begin{lstlisting}[caption={Generaci\'on de embeddings sint\'eticos normalizados.}]
+def generar_embeddings(N, D, seed=42):
+    rng = np.random.default_rng(seed)
+    X = rng.normal(0, 1, size=(N, D)).astype(np.float32)
+
+    normas = np.linalg.norm(X, axis=1, keepdims=True)
+    normas[normas == 0] = 1.0
+
+    X = X / normas
+    return X.astype(np.float32)
+\end{lstlisting}
+
+\subsection{Estimaci\'on de Memoria}
+
+\subsubsection{Matriz completa de similitud}
+
+La matriz completa de similitud tendr\'ia $400\,000\,000$ elementos. En
+precisi\'on \texttt{float32}, cada elemento ocupa $4$ bytes:
+
+\[
+400\,000\,000 \times 4 = 1\,600\,000\,000 \text{ bytes}
+\]
+
+Esto equivale aproximadamente a:
+
+\[
+1.49 \text{ GiB} \approx 1.6 \text{ GB}
+\]
+
+En \texttt{float64}, cada elemento ocupa $8$ bytes:
+
+\[
+400\,000\,000 \times 8 = 3\,200\,000\,000 \text{ bytes}
+\]
+
+Esto equivale aproximadamente a:
+
+\[
+2.98 \text{ GiB} \approx 3.2 \text{ GB}
+\]
+
+Estas cifras solo consideran la matriz de similitud. En una ejecuci\'on real
+tambi\'en se requieren memoria para el dataset, \'indices, estructuras de
+ordenamiento y temporales internos. Adem\'as, almacenar toda la matriz es
+ineficiente porque solo se conservan $10$ vecinos por cada vector.
+
+\subsubsection{Memoria de la matriz de embeddings}
+
+La matriz original $X$ en \texttt{float32} ocupa:
+
+\[
+20\,000 \times 128 \times 4 = 10\,240\,000 \text{ bytes}
+\]
+
+\[
+\approx 9.77 \text{ MiB}
+\]
+
+\subsubsection{Memoria de top-$k$}
+
+Para guardar los $10$ mejores valores y sus \'indices por cada vector:
+
+\[
+20\,000 \times 10 \times 4 = 800\,000 \text{ bytes}
+\]
+
+para valores, y la misma cantidad para \'indices enteros de 32 bits. En total:
+
+\[
+1\,600\,000 \text{ bytes} \approx 1.53 \text{ MiB}
+\]
+
+\subsubsection{Memoria temporal por bloques}
+
+En la implementaci\'on usada, las filas se particionan entre workers y las
+columnas se procesan en bloques de tama\~no $B=1024$. Cada worker calcula una
+submatriz temporal:
+
+\[
+S_{\text{temp}} = X_{\text{filas worker}} X_{\text{bloque columnas}}^T
+\]
+
+Con $8$ workers, cada worker procesa aproximadamente:
+
+\[
+\frac{20\,000}{8}=2\,500
+\]
+
+filas. La matriz temporal por worker tiene entonces:
+
+\[
+2\,500 \times 1024 = 2\,560\,000
+\]
+
+valores \texttt{float32}, lo que equivale aproximadamente a $9.77$ MiB por
+worker. La memoria temporal agregada para los $8$ workers se mantiene cercana a
+$78$ MiB, sin considerar temporales internos de \texttt{NumPy}. Aun as\'i, este
+consumo es muy inferior a mantener la matriz completa de similitud.
+
+\subsection{Comparaci\'on de Estrategias}
+
+\subsubsection{Estrategia A: matriz completa m\'as ordenamiento}
+
+Esta alternativa calcula directamente:
+
+\[
+S = XX^T
+\]
+
+Luego ordena cada fila de $S$ para obtener los $10$ mayores valores. Su ventaja
+principal es la simplicidad conceptual y la posibilidad de usar multiplicaci\'on
+matricial altamente optimizada. Sin embargo, presenta tres problemas:
+
+\begin{itemize}
+    \item Materializa $400\,000\,000$ similitudes aunque solo se requieren
+        $20\,000 \times 10$ resultados finales.
+    \item Requiere al menos $1.49$ GiB en \texttt{float32} solo para la matriz
+        de similitud.
+    \item Ordenar filas completas de $20\,000$ elementos es innecesario cuando
+        solo se busca top-$10$.
+\end{itemize}
+
+Por estas razones, se descarta como estrategia final.
+
+\subsubsection{Estrategia B: bloques exactos con top-$k$ incremental}
+
+Esta alternativa divide el c\'alculo en bloques. Cada bloque de columnas se
+compara contra un subconjunto de filas y se actualiza el top-$10$ de cada vector
+sin almacenar todas las similitudes. El bloque temporal se descarta luego de
+actualizar los candidatos.
+
+La estrategia mantiene exactitud porque todos los pares son comparados, pero no
+materializa la matriz global. Su costo computacional sigue siendo $O(N^2D)$,
+pero el consumo de memoria se reduce significativamente. Esta es la estrategia
+seleccionada.
+
+\subsubsection{Estrategia C: b\'usqueda aproximada de vecinos}
+
+Una alternativa para escenarios de mayor escala es usar t\'ecnicas aproximadas
+como ANN, HNSW o FAISS. Estas reducen el n\'umero de comparaciones y escalan
+mejor a millones de vectores. Sin embargo, no garantizan recuperar exactamente
+el top-$10$ real, por lo que requieren una m\'etrica de calidad como:
+
+\[
+Recall@10 =
+\frac{|Top10_{\text{exacto}} \cap Top10_{\text{aproximado}}|}{10}
+\]
+
+No se selecciona esta alternativa porque el tama\~no exigido en el enunciado
+puede resolverse con una estrategia exacta por bloques.
+
+\subsection{Estrategia Seleccionada}
+
+La estrategia final consiste en:
+
+\begin{enumerate}
+    \item Generar o cargar una matriz $X$ de $20\,000 \times 128$ en
+        \texttt{float32}.
+    \item Normalizar cada vector a norma $1$.
+    \item Compartir $X$ entre procesos usando \texttt{shared\_memory}.
+    \item Particionar las filas entre workers.
+    \item Recorrer las columnas en bloques de tama\~no $B=1024$.
+    \item Calcular similitudes parciales con multiplicaci\'on matricial:
+        \[
+        S_{\text{bloque}} = X_{\text{filas}}X_{\text{columnas}}^T
+        \]
+    \item Eliminar la diagonal asignando $-\infty$ a la comparaci\'on
+        $x_i$ contra s\'i mismo.
+    \item Actualizar top-$10$ mediante \texttt{argpartition}, sin ordenar todos
+        los candidatos.
+    \item Retornar los top-$10$ parciales de cada bloque de filas y construir
+        el resultado global.
+\end{enumerate}
+
+\subsubsection{Pseudoc\'odigo}
+
+\begin{lstlisting}[caption={Pseudoc\'odigo de la estrategia por bloques.}]
+Entrada: X normalizada, N, D, K=10, B=1024, workers
+
+Compartir X en memoria compartida
+
+Dividir filas de X entre workers
+
+Para cada worker en paralelo:
+    recibir rango de filas [inicio, fin)
+    inicializar top_values con -infinito
+    inicializar top_indices con -1
+
+    Para col_start desde 0 hasta N con paso B:
+        col_end = min(col_start + B, N)
+        Xj = X[col_start:col_end]
+
+        sims = X[inicio:fin] @ Xj.T
+
+        Si una fila se compara consigo misma:
+            sims[fila_local, columna_local] = -infinito
+
+        candidatos = concatenar(top_actual, sims)
+        indices = concatenar(indices_actuales, indices_del_bloque)
+
+        conservar solo los K mayores con argpartition
+
+    ordenar top-K final de mayor a menor
+    retornar top_values y top_indices
+
+Unir resultados parciales de todos los workers
+\end{lstlisting}
+
+\subsubsection{Fragmento de C\'odigo Relevante}
+
+\begin{lstlisting}[caption={Worker que procesa un rango de filas y actualiza top-$k$.}]
+def worker_topk(args):
+    row_start, row_end, N, D, B, K, shm_name = args
+
+    shm = shared_memory.SharedMemory(name=shm_name)
+    X = np.ndarray((N, D), dtype=np.float32, buffer=shm.buf)
+
+    row_count = row_end - row_start
+    Xi = X[row_start:row_end]
+
+    top_values = np.full((row_count, K), -np.inf, dtype=np.float32)
+    top_indices = np.full((row_count, K), -1, dtype=np.int32)
+
+    row_ids = np.arange(row_start, row_end, dtype=np.int32)
+
+    for col_start in range(0, N, B):
+        col_end = min(col_start + B, N)
+        Xj = X[col_start:col_end]
+
+        sims = Xi @ Xj.T
+
+        mask = (row_ids >= col_start) & (row_ids < col_end)
+        if np.any(mask):
+            local_rows = np.where(mask)[0]
+            local_cols = row_ids[mask] - col_start
+            sims[local_rows, local_cols] = -np.inf
+
+        col_indices = np.arange(col_start, col_end, dtype=np.int32)
+        col_indices_matrix = np.broadcast_to(col_indices, sims.shape)
+
+        candidatos_values = np.concatenate((top_values, sims), axis=1)
+        candidatos_indices = np.concatenate((top_indices, col_indices_matrix), axis=1)
+
+        pos = np.argpartition(candidatos_values, -K, axis=1)[:, -K:]
+
+        top_values = np.take_along_axis(candidatos_values, pos, axis=1)
+        top_indices = np.take_along_axis(candidatos_indices, pos, axis=1)
+
+    orden = np.argsort(-top_values, axis=1)
+    top_values = np.take_along_axis(top_values, orden, axis=1)
+    top_indices = np.take_along_axis(top_indices, orden, axis=1)
+
+    shm.close()
+    return row_start, top_values, top_indices
+\end{lstlisting}
+
+\subsection{Paralelizaci\'on, Balance de Carga y Localidad de Memoria}
+
+\subsubsection{Paralelizaci\'on}
+
+La paralelizaci\'on se realiza por partici\'on de filas. Cada proceso recibe un
+rango de filas distinto y calcula el top-$10$ de esos vectores compar\'andolos
+contra todos los bloques de columnas. La matriz $X$ es compartida en modo solo
+lectura, por lo que no hay condiciones de carrera sobre los embeddings.
+
+Cada worker mantiene sus propios arreglos locales \texttt{top\_values} y
+\texttt{top\_indices}. Como ning\'un worker escribe el top-$k$ de filas ajenas,
+no se requiere bloqueo, \texttt{critical}, \texttt{lock} ni sincronizaci\'on fina
+durante el c\'alculo principal.
+
+\subsubsection{Balance de carga}
+
+El balance de carga es adecuado porque todos los workers reciben una cantidad
+similar de filas. Cada fila debe compararse contra los $N$ vectores, por lo que
+el trabajo asignado a cada worker es aproximadamente:
+
+\[
+\frac{N}{p} \times N \times D
+\]
+
+donde $p$ es el n\'umero de workers. Para $N=20\,000$ y $p=8$, cada worker
+procesa aproximadamente $2\,500$ filas contra los $20\,000$ vectores.
+
+\subsubsection{Localidad de memoria}
+
+La localidad de memoria mejora porque las columnas se recorren en bloques de
+$1024$ vectores. Cada bloque $X_j$ se reutiliza para calcular similitudes contra
+todas las filas asignadas al worker. Adem\'as, al mantener top-$k$ local se
+evita escribir una matriz global de $N \times N$ similitudes.
+
+Sin embargo, el algoritmo sigue generando matrices temporales para cada bloque,
+por lo que el rendimiento puede quedar limitado por ancho de banda de memoria,
+creaci\'on de temporales y operaciones de selecci\'on top-$k$.
+
+\subsection{Benchmark y Resultados}
+
+\subsubsection{Registro del entorno de ejecuci\'on}
+
+\begin{itemize}
+    \item \textbf{Sistema operativo}: Windows, ejecuci\'on desde PowerShell.
+    \item \textbf{Lenguaje}: Python.
+    \item \textbf{Librer\'ias principales}: \texttt{NumPy},
+        \texttt{multiprocessing}, \texttt{concurrent.futures}.
+    \item \textbf{Archivo ejecutado}: \texttt{Ejercicio\_3.py}.
+    \item \textbf{Tama\~no de datos}: $20\,000 \times 128$ embeddings.
+    \item \textbf{Tipo de dato}: \texttt{float32}.
+    \item \textbf{Top-k}: $K=10$.
+    \item \textbf{Tama\~no de bloque}: $B=1024$.
+    \item \textbf{Workers evaluados}: $1$, $2$, $4$ y $8$.
+    \item \textbf{Repeticiones}: una ejecuci\'on por configuraci\'on.
+    \item \textbf{CPU y RAM}: no registradas expl\'icitamente en la captura;
+        se recomienda agregarlas desde el equipo usado antes de la entrega
+        final.
+\end{itemize}
+
+\subsubsection{M\'etricas utilizadas}
+
+Las m\'etricas evaluadas fueron:
+
+\[
+S_p = \frac{T_1}{T_p}
+\]
+
+\[
+E_p = \frac{S_p}{p}
+\]
+
+\[
+Throughput = \frac{N(N-1)}{T_p}
+\]
+
+donde $T_1$ es el tiempo con un worker, $T_p$ es el tiempo con $p$ workers y
+$N(N-1)$ corresponde al n\'umero de comparaciones excluyendo la diagonal.
+
+\subsubsection{Tabla de benchmark}
+
+\begin{table}[H]
+\centering
+\begin{tabular}{crrrr}
+\toprule
+\textbf{Workers} & \textbf{Tiempo (s)} & \textbf{Speedup} & \textbf{Eficiencia} & \textbf{Throughput comp/s} \\
+\midrule
+1 & 4.1124 & 1.0000 & 1.0000 & 97\,263\,029.82 \\
+2 & 2.3791 & 1.7286 & 0.8643 & 168\,124\,738.32 \\
+4 & 1.8001 & 2.2845 & 0.5711 & 222\,200\,717.06 \\
+8 & 1.6417 & 2.5049 & 0.3131 & 243\,636\,060.18 \\
+\bottomrule
+\end{tabular}
+\caption{Resultados experimentales del c\'alculo de similitud por bloques.}
+\end{table}
+
+\subsubsection{An\'alisis de resultados}
+
+Los resultados muestran una mejora efectiva al aumentar el n\'umero de workers.
+Con $1$ worker el tiempo total fue de $4.1124$ segundos, mientras que con $8$
+workers se redujo a $1.6417$ segundos. Esto corresponde a un speedup m\'aximo
+de:
+
+\[
+S_8 = \frac{4.1124}{1.6417} = 2.5049
+\]
+
+El throughput tambi\'en mejora desde $97.26$ millones de comparaciones por
+segundo con $1$ worker hasta $243.64$ millones de comparaciones por segundo con
+$8$ workers.
+
+Sin embargo, la escalabilidad no es lineal. La eficiencia cae desde $0.8643$ con
+$2$ workers hasta $0.3131$ con $8$ workers. Esto indica que el algoritmo escala,
+pero comienza a saturarse por overhead de paralelizaci\'on y presi\'on sobre la
+memoria. Entre las causas probables est\'an:
+
+\begin{itemize}
+    \item creaci\'on de procesos;
+    \item acceso concurrente a memoria compartida;
+    \item matrices temporales \texttt{sims};
+    \item operaciones \texttt{concatenate};
+    \item selecci\'on parcial con \texttt{argpartition};
+    \item copias de resultados parciales desde los workers al proceso principal;
+    \item limitaciones del ancho de banda de memoria.
+\end{itemize}
+
+La mejor configuraci\'on en tiempo total fue $8$ workers. No obstante, desde el
+punto de vista de eficiencia paralela, $2$ workers aprovechan mejor los recursos,
+ya que entregan $1.7286\times$ de speedup con una eficiencia de $86.43\%$.
+
+\subsection{M\'etrica de Calidad}
+
+La estrategia implementada es exacta, no aproximada. Todos los vectores son
+comparados contra todos los dem\'as vectores, y el top-$10$ se obtiene mediante
+selecci\'on parcial. Por lo tanto, no se requiere una m\'etrica de calidad como
+\texttt{Recall@10}, que ser\'ia necesaria si se usara una t\'ecnica aproximada.
+
+Aun as\'i, se propone validar la correcci\'on comparando el resultado por bloques
+contra una implementaci\'on de referencia con matriz completa para un subconjunto
+peque\~no, por ejemplo $N=1000$. Si los \'indices top-$10$ coinciden para cada
+fila, se valida que la estrategia por bloques conserva el resultado exacto sin
+almacenar toda la matriz.
+
+\subsection{Riesgos, Limitaciones y Condiciones de Falla}
+
+\begin{enumerate}
+    \item \textbf{Costo cuadr\'atico}: aunque se reduce el consumo de memoria,
+        el algoritmo sigue realizando $O(N^2D)$ operaciones. Para datasets de
+        cientos de miles o millones de embeddings, el enfoque exacto puede dejar
+        de ser viable.
+    \item \textbf{Escalabilidad sublineal}: los resultados muestran que aumentar
+        workers no genera speedup proporcional. A partir de cierto punto, el
+        overhead y el ancho de banda de memoria dominan.
+    \item \textbf{Memoria temporal}: aunque no se almacena la matriz completa,
+        cada worker crea matrices temporales. Con bloques demasiado grandes,
+        la memoria puede crecer y afectar el rendimiento.
+    \item \textbf{Tama\~no de bloque}: bloques peque\~nos aumentan overhead de
+        iteraci\'on; bloques grandes aumentan uso de memoria. El valor $B=1024$
+        representa un compromiso pr\'actico.
+    \item \textbf{Diagonal}: si no se elimina la comparaci\'on $x_i$ contra
+        $x_i$, cada vector aparecer\'ia como su propio vecino m\'as similar.
+    \item \textbf{Dependencia del hardware}: el rendimiento depende del n\'umero
+        real de n\'ucleos, ancho de banda de memoria, implementaci\'on BLAS de
+        \texttt{NumPy} y carga del sistema.
+    \item \textbf{Aproximaciones futuras}: para vol\'umenes mayores se deber\'ia
+        considerar FAISS, HNSW o ANN, midiendo calidad mediante \texttt{Recall@10}
+        contra una referencia exacta.
+\end{enumerate}
+
+\subsection{Conclusiones}
+
+\begin{enumerate}
+    \item La matriz completa de similitud requiere aproximadamente $1.49$ GiB
+        en \texttt{float32} y $2.98$ GiB en \texttt{float64}, sin contar
+        temporales ni estructuras adicionales.
+    \item La estrategia por bloques evita materializar la matriz completa y
+        mantiene solo el top-$10$ por vector.
+    \item La partici\'on por filas evita condiciones de carrera porque cada
+        worker actualiza \'unicamente sus propios resultados.
+    \item El mejor tiempo observado fue $1.6417$ segundos con $8$ workers,
+        obteniendo un speedup de $2.5049\times$.
+    \item La eficiencia cae al aumentar workers, lo que evidencia saturaci\'on
+        por overhead y memoria. Esto es esperable en un problema con alto volumen
+        de datos y selecci\'on top-$k$ incremental.
+    \item La estrategia seleccionada es exacta; no requiere una m\'etrica de
+        calidad aproximada, aunque se recomienda validar contra una matriz
+        completa en un subconjunto peque\~no.
+\end{enumerate}
+
+\subsection{Declaraci\'on de Uso de Herramientas}
+
+Se utiliz\'o apoyo de IA generativa para estructurar el informe, revisar la
+justificaci\'on t\'ecnica y adaptar la explicaci\'on a los criterios de la
+evaluaci\'on. El c\'odigo fue ejecutado y validado experimentalmente por el
+grupo, y los resultados incluidos corresponden a la corrida mostrada para el
+archivo \texttt{Ejercicio\_3.py}.
+
+\subsection{Referencias}
+
+\begin{enumerate}
+    \item Grama, A., Gupta, A., Karypis, G., \& Kumar, V. (2003).
+    \textit{Introduction to Parallel Computing}. Addison-Wesley.
+    \item Pacheco, P. (2011). \textit{An Introduction to Parallel Programming}.
+    Morgan Kaufmann.
+    \item NumPy Developers. \textit{NumPy Documentation}. Disponible en:
+    \url{https://numpy.org/doc/}
+    \item Python Software Foundation. \textit{multiprocessing documentation}.
+    Disponible en: \url{https://docs.python.org/3/library/multiprocessing.html}
+    \item INF8090 -- Computaci\'on Paralela y Distribuida. Enunciado de
+    Evaluaci\'on 1, Segunda Parte, Ejercicio 3.
+\end{enumerate}
+
+\end{document}
